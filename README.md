@@ -1,61 +1,43 @@
-# SHN-MEDIAPIPE
-![Project Cover](assets/cover.jpeg)
-#  [Your Project Name]
+🚀 FreshPick: 360° Assistive Freshness Tracker
+💡 What's the idea?
+FreshPick is an assistive non-visual kitchen tool designed for visually impaired individuals to manage their produce. Because users cannot see if an item is properly framed in the camera, FreshPick uses MediaPipe to track their hand and guides them into the center frame using spatial audio "sonar" beeps. It tracks the 3D rotation of their wrist to ensure a full 360° scan of the fruit (front and back), analyzes the ripeness using a Vision-Language Model, and speaks a priority list of which fruits to eat first and which to save for later.
 
-### 💡 What's the idea?
-[Tell us what you built and what it does. Keep it short!]
+🌐 Check it out!
+Live Website: N/A (Desktop Python Application)
 
-### 🌐 Check it out!
-- **Live Website:** [Drop your link here / N/A]
-- **GitHub Repo:** [Drop your repository link here]
+GitHub Repo: https://github.com/parvathykmanoj12-coder/SHN1-MEDIAPIPE.git
+             https://github.com/annrose2277-glitch/SHN1-MEDIAPIPE.git
 
-### 🛠️ What did you use?
-[Tech stack, tools, frameworks, libraries, etc.]
+🛠️ What did you use?
+Core Language: Python 3.10+
 
-### 👥 The Humans Behind It
-- [Name – GitHub Username]
-- [Name – GitHub Username]
+Spatial Tracking: Google MediaPipe (HandLandmarker API)
 
-### ⚙️ Hardware Corner
-[What hardware did you use? / N/A]
+Computer Vision: OpenCV (cv2) & HSV Color Masking
 
-### 📸 Show Us What You Built!
-[Add screenshots, photos, GIFs or demo video links here.]
+AI / VLM: Google Gemini 3.8 Flash API (google-genai)
 
-### ✨ Cool Things It Does
-- [Feature 1]
-- [Feature 2]
-- [Feature 3]
+Accessibility: pyttsx3 (Offline Text-to-Speech) & winsound (Spatial Audio Cues)
 
----
+👥 The Humans Behind It
+Ann Rose Mathew – [@annrose2277-glitch]
 
-**Built with curiosity at Saturday Hack Night 💜**# 🚀 [Your Project Name]
+Parvathy K Manoj – [@parvathykmanoj12-coder]
 
-### 💡 What's the idea?
-[Tell us what you built and what it does. Keep it short!]
 
-### 🌐 Check it out!
-- **Live Website:** [Drop your link here / N/A]
-- **GitHub Repo:** [Drop your repository link here]
+⚙️ Hardware Corner
+Standard Laptop Webcam (RGB)
 
-### 🛠️ What did you use?
-[Tech stack, tools, frameworks, libraries, etc.]
+📸 Show Us What You Built!
+https://drive.google.com/file/d/1Ws1r2bnMx5jifdZZR2zvMCnhVmQaRIuS/view?usp=drivesdk
 
-### 👥 The Humans Behind It
-- [Name – GitHub Username]
-- [Name – GitHub Username]
+✨ Cool Things It Does
+Zero-Vision Audio Homing: Uses low/high pitch beeps to actively guide the user's hand to the center of the camera.
 
-### ⚙️ Hardware Corner
-[What hardware did you use? / N/A]
+360° Palm Normal Tracking: Calculates the 3D vector of the palm to detect when the user has physically rotated their wrist 180 degrees to capture the back of the fruit.
 
-### 📸 Show Us What You Built!
-[Add screenshots, photos, GIFs or demo video links here.]
+Smart Priority Sorting: Remembers every fruit scanned during the session and ranks them from "Eat Today" (Use First) to "Store Longer" (Use Last).
 
-### ✨ Cool Things It Does
-- [Feature 1]
-- [Feature 2]
-- [Feature 3]
+Gesture Controls: Detects an "Open Palm" gesture to read aloud the pantry priority list, or a "Pinch" to force an instant scan.
 
----
-
-**Built with curiosity at Saturday Hack Night 💜**
+Built with curiosity at Saturday Hack Night 💜
