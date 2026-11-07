@@ -49,7 +49,7 @@ class PantryMemory:
 
     def get_sorted_items(self) -> list[dict]:
         with self._lock:
-            return sorted((x.copy() for x in self.items), key=lambda x: (URGENCY_WEIGHT[x["urgency"]], x["id"]))
+            return sorted((x.copy() for x in self.items), key=lambda x: (URGENCY_WEIGHT.get(x.get("urgency", "USE_SOON"), 2), x.get("id", 0)))
 
     def get_spoken_recap(self, max_items: int = 5) -> str:
         ordered = self.get_sorted_items()
