@@ -1,170 +1,172 @@
+"""Multiview fruit inspection using Gemini (existing project's backend) or Moondream2.
+
+A model's answer is not proof of food safety, internal ripeness, or complete
+360-degree visual coverage. There is deliberately no HSV->fruit/urgency guess.
+"""
+from __future__ import annotations
+
 import json
 import os
+from typing import Literal
+
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
+from pydantic import BaseModel, Field
 
-try:
-    from google import genai
-    HAS_GENAI = True
-except ImportError:
-    HAS_GENAI = False
+from decision_engine import normalize_observation, unknown_result
+
+
+class FruitObservation(BaseModel):
+    fruit_name: str = Field(description="Specific fruit name or 'Unknown fruit'.")
+    fruit_visible: bool = Field(description="Is any fruit visible?")
+    fruit_count: int = Field(description="Number of distinct fruits visible; zero if uncertain.")
+    view_quality: Literal["CLEAR", "PARTIAL", "POOR"]
+    ripeness_stage: Literal["OVERRIPE", "RIPE", "UNDERRIPE", "UNKNOWN"]
+    possible_mold_or_rot: bool = Field(description="True if suspicious visible growth, holes, leaking or severe decay is seen; conservative flag.")
+    visible_features: str = Field(description="At most 12 words about external colors, spots and wrinkles. Avoid claims about internal condition.")
+
+
+PROMPT = (
+    "You are describing a single physical fruit for a person with low or no vision. "
+    "Images are sequential views of the same fruit, not separate fruit items. "
+    "Name the fruit only if visually recognizable, otherwise say Unknown fruit. "
+    "Assess only *visible* peel/skin cues and be conservative. "
+    "Classify UNDERRIPE, RIPE, OVERRIPE or UNKNOWN according to this fruit species, "
+    "not just universal green/yellow/red rules. An apple can be naturally green when ripe. "
+    "Set possible_mold_or_rot true if a visible area may be mold, severe damage or leaking. "
+    "Never assert that food is safe, mold-free, edible, or fresh internally. "
+    "Set view_quality to PARTIAL or POOR when the view is blocked, blurred or too dark. "
+    "If the fruit cannot be reliably recognized or staged, use UNKNOWN. "
+    "Give a short visible_features description; no estimates of exact days or expiry dates."
+)
 
 
 class VisionAnalyzer:
-    def __init__(self):
-        self.api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    def __init__(self, backend: str | None = None):
+        self.backend = (backend or os.getenv("FRESHPICK_BACKEND", "gemini")).strip().lower()
+        self.model_name = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
         self.client = None
-        if HAS_GENAI and self.api_key:
+        self.local_model = None
+        self.init_error = None
+        if self.backend == "gemini":
+            key = os.getenv("GEMINI_API_KEY", "").strip()
+            if not key:
+                self.init_error = "No GEMINI_API_KEY was found in the root .env file."
+            else:
+                try:
+                    from google import genai
+                    self.client = genai.Client(api_key=key)
+                except Exception as exc:
+                    self.init_error = f"Gemini client could not start: {exc}"
+        elif self.backend == "moondream":
+            # First use downloads a large model. This path is NOT inherently int4.
             try:
-                self.client = genai.Client(api_key=self.api_key)
-                print("[VisionAnalyzer] Gemini Vision-Language Model connected.")
-            except Exception as e:
-                print(f"[VisionAnalyzer] Gemini init failed, using OpenCV offline mode: {e}")
+                from transformers import AutoModelForCausalLM
+                model_revision = os.getenv("MOONDREAM_REVISION", "2025-06-21")
+                self.local_model = AutoModelForCausalLM.from_pretrained(
+                    "vikhyatk/moondream2", revision=model_revision,
+                    trust_remote_code=True,
+                )
+                self.local_model.eval()
+            except Exception as exc:
+                self.init_error = f"Moondream2 could not load: {exc}"
+        elif self.backend == "opencv":
+            self.init_error = "Offline color-only mode: fruit recognition and ripeness ranking are disabled."
         else:
-            print("[VisionAnalyzer] Running in Offline OpenCV HSV + Ripeness Mode (Set GEMINI_API_KEY for VLM mode).")
+            self.init_error = f"Unknown backend {self.backend!r}. Use gemini, moondream, or opencv."
+        if self.init_error:
+            print("[VisionAnalyzer]", self.init_error)
+
+    @staticmethod
+    def _prepare_collage(bgr_frames: list[np.ndarray]) -> Image.Image | None:
+        good_frames = [f for f in bgr_frames if isinstance(f, np.ndarray) and f.size > 0]
+        if not good_frames:
+            return None
+        # Two views give useful context while keeping inference manageable.
+        selected = [good_frames[0], good_frames[-1]] if len(good_frames) > 1 else [good_frames[0]]
+        width, height = 440, 370
+        collage = Image.new("RGB", (width * len(selected), height + 28), "white")
+        drawer = ImageDraw.Draw(collage)
+        for index, frame in enumerate(selected):
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(rgb)
+            img.thumbnail((width, height))
+            x = index * width + (width - img.width) // 2
+            y = 28 + (height - img.height) // 2
+            collage.paste(img, (x, y))
+            drawer.text((index * width + 10, 8), f"View {index + 1}", fill="black")
+        return collage
+
+    def analyze_views(self, frames: list[np.ndarray]) -> dict:
+        image = self._prepare_collage(frames)
+        if image is None:
+            return unknown_result("No clear images were captured.")
+        if self.init_error:
+            outcome = unknown_result("The fruit recognition model is unavailable.")
+            colors = self._describe_colors(image)
+            if colors:
+                outcome["surface_description"] = colors
+                outcome["spoken_text"] = (
+                    f"I can see {colors}, but cannot identify the fruit or rank its ripeness offline. "
+                    "Please scan again with a configured vision model."
+                )
+            return outcome
+        try:
+            if self.backend == "gemini":
+                observation = self._ask_gemini(image)
+            else:
+                observation = self._ask_moondream(image)
+            return normalize_observation(observation)
+        except Exception as exc:
+            print("[VisionAnalyzer] analysis failed:", repr(exc))
+            # Do not use color heuristics as if they provided reliable fruit identity.
+            return unknown_result("The image analysis failed or was inconclusive.")
+
+    @staticmethod
+    def _describe_colors(image: Image.Image) -> str:
+        """Conservative HSV diagnostic. Color alone cannot identify fruit or ripeness."""
+        hsv = cv2.cvtColor(np.asarray(image.convert("RGB")), cv2.COLOR_RGB2HSV)
+        masks = {
+            "green tones": cv2.inRange(hsv, (36, 55, 55), (85, 255, 255)),
+            "yellow tones": cv2.inRange(hsv, (18, 55, 55), (35, 255, 255)),
+            "orange tones": cv2.inRange(hsv, (10, 60, 60), (17, 255, 255)),
+            "red tones": cv2.bitwise_or(cv2.inRange(hsv, (0, 75, 55), (9, 255, 255)),
+                                          cv2.inRange(hsv, (165, 75, 55), (179, 255, 255))),
+        }
+        count = hsv.shape[0] * hsv.shape[1]
+        ranked = sorted(((int(np.count_nonzero(mask)) / count, name)
+                         for name, mask in masks.items()), reverse=True)
+        return ranked[0][1] if ranked and ranked[0][0] > 0.12 else ""
+
+    def _ask_gemini(self, image: Image.Image) -> dict:
+        from google.genai import types
+        response = self.client.models.generate_content(
+            model=self.model_name,
+            contents=[PROMPT, image],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json", response_schema=FruitObservation,
+                temperature=0.1,
+            ),
+        )
+        if not response.text:
+            raise ValueError("Empty model response")
+        return FruitObservation.model_validate_json(response.text).model_dump()
+
+    def _ask_moondream(self, image: Image.Image) -> dict:
+        # Moondream2 lacks Gemini's enforced JSON schema. Validate its text strictly.
+        question = (PROMPT + " Output one JSON object with exactly these keys: "
+                    "fruit_name, fruit_visible, fruit_count, view_quality, "
+                    "ripeness_stage, possible_mold_or_rot, visible_features. "
+                    "No markdown, only JSON.")
+        answer = self.local_model.query(image, question)["answer"].strip()
+        if answer.startswith("```"):
+            answer = answer.strip("`").removeprefix("json").strip()
+        start, end = answer.find("{"), answer.rfind("}")
+        if start < 0 or end < start:
+            raise ValueError("Moondream did not return a JSON object")
+        return FruitObservation.model_validate(json.loads(answer[start:end + 1])).model_dump()
 
     def analyze_single_fruit(self, bgr_crop: np.ndarray) -> dict:
-        """
-        Returns a structured dictionary:
-        {
-            'fruit_name': str,
-            'surface_description': str,
-            'urgency': 'EAT_TODAY' | 'USE_SOON' | 'STORE_LONGER',
-            'spoken_text': str
-        }
-        """
-        if bgr_crop is None or bgr_crop.size == 0:
-            return {
-                "fruit_name": "Unknown",
-                "surface_description": "No clear fruit region captured.",
-                "urgency": "USE_SOON",
-                "spoken_text": "Could not see the fruit clearly. Hold it near the center and pinch again.",
-            }
-
-        if self.client is not None:
-            vlm_result = self._analyze_with_gemini(bgr_crop)
-            if vlm_result is not None:
-                return vlm_result
-
-        return self._analyze_with_opencv_hsv(bgr_crop)
-
-    def compare_two_fruits(self, left_crop: np.ndarray, right_crop: np.ndarray) -> str:
-        """Compare two fruits held in Left and Right hands and return spoken recommendation."""
-        left_info = self.analyze_single_fruit(left_crop)
-        right_info = self.analyze_single_fruit(right_crop)
-
-        priority_rank = {"EAT_TODAY": 1, "USE_SOON": 2, "STORE_LONGER": 3}
-        l_rank = priority_rank.get(left_info["urgency"], 2)
-        r_rank = priority_rank.get(right_info["urgency"], 2)
-
-        if l_rank < r_rank:
-            recommendation = "Use the fruit in your left hand first, and save the right hand fruit for later."
-        elif r_rank < l_rank:
-            recommendation = "Use the fruit in your right hand first, and save the left hand fruit for later."
-        else:
-            recommendation = "Both fruits have similar surface ripeness and can be used in either order."
-
-        return (
-            f"Left hand holds {left_info['fruit_name']} with {left_info['surface_description']}. "
-            f"Right hand holds {right_info['fruit_name']} with {right_info['surface_description']}. "
-            f"{recommendation}"
-        )
-
-    def _analyze_with_gemini(self, bgr_crop: np.ndarray):
-        """Image-to-Text analysis using Gemini 2.5 Flash."""
-        try:
-            rgb = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2RGB)
-            pil_img = Image.fromarray(rgb)
-
-            prompt = (
-                "You are FreshPick, an assistive Image-to-Text translator for a visually impaired user. "
-                "Examine the fruit or produce held in the user's hand. "
-                "Respond ONLY in valid JSON with these exact keys:\n"
-                "{\n"
-                '  "fruit_name": "name of fruit (e.g. Banana, Apple, Tomato, Orange)",\n'
-                '  "surface_description": "short description of visible peel color, spots, or wrinkles",\n'
-                '  "urgency": "EAT_TODAY or USE_SOON or STORE_LONGER",\n'
-                '  "spoken_text": "2 clear spoken sentences describing the fruit, visible surface ripeness, '
-                'whether to eat it first or keep it longer, and a brief reminder that camera only sees surface '
-                'so gently check firmness."\n'
-                "}"
-            )
-
-            response = self.client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[pil_img, prompt],
-            )
-            raw_text = response.text.strip()
-            if raw_text.startswith("```"):
-                raw_text = raw_text.strip("`").replace("json", "", 1).strip()
-
-            data = json.loads(raw_text)
-            return {
-                "fruit_name": data.get("fruit_name", "Fruit"),
-                "surface_description": data.get("surface_description", "visible surface analyzed"),
-                "urgency": data.get("urgency", "USE_SOON"),
-                "spoken_text": data.get("spoken_text", "Fruit scanned."),
-            }
-        except Exception as e:
-            print(f"[VisionAnalyzer] VLM fallback triggered: {e}")
-            return None
-
-    def _analyze_with_opencv_hsv(self, bgr_crop: np.ndarray) -> dict:
-        """
-        Offline HSV peel color + dark spot ratio analyzer.
-        Estimates dominant fruit color and surface browning/spotting.
-        """
-        resized = cv2.resize(bgr_crop, (160, 160))
-        hsv = cv2.cvtColor(resized, cv2.COLOR_BGR2HSV)
-
-        # Ignore very dark background or skin-tone neutral regions where possible
-        total_pixels = resized.shape[0] * resized.shape[1]
-
-        # Color masks in HSV
-        yellow_mask = cv2.inRange(hsv, (18, 70, 70), (35, 255, 255))
-        green_mask = cv2.inRange(hsv, (36, 50, 50), (85, 255, 255))
-        red_mask1 = cv2.inRange(hsv, (0, 80, 60), (10, 255, 255))
-        red_mask2 = cv2.inRange(hsv, (165, 80, 60), (180, 255, 255))
-        red_mask = cv2.bitwise_or(red_mask1, red_mask2)
-        orange_mask = cv2.inRange(hsv, (11, 80, 70), (17, 255, 255))
-        brown_dark_mask = cv2.inRange(hsv, (0, 30, 15), (25, 200, 95))
-
-        yellow_ratio = np.count_nonzero(yellow_mask) / total_pixels
-        green_ratio = np.count_nonzero(green_mask) / total_pixels
-        red_ratio = np.count_nonzero(red_mask) / total_pixels
-        orange_ratio = np.count_nonzero(orange_mask) / total_pixels
-        spot_ratio = np.count_nonzero(brown_dark_mask) / total_pixels
-
-        color_scores = {
-            "Banana or Yellow Fruit": yellow_ratio,
-            "Green Apple or Unripe Fruit": green_ratio,
-            "Apple or Tomato": red_ratio,
-            "Orange or Citrus": orange_ratio,
-        }
-        best_fruit = max(color_scores, key=color_scores.get)
-
-        # Determine ripeness urgency based on dark spots and green/yellow balance
-        if spot_ratio > 0.18:
-            urgency = "EAT_TODAY"
-            surface_desc = "noticeable dark surface spots and mature peel tone"
-            advice = "Use this first, ideally today. Gently check firmness since cameras only inspect the outside."
-        elif green_ratio > 0.22 and green_ratio > yellow_ratio:
-            urgency = "STORE_LONGER"
-            surface_desc = "mostly firm green surface with minimal spotting"
-            advice = "This is still underripe and can stay for several days."
-        else:
-            urgency = "USE_SOON"
-            surface_desc = "even, ripe surface color with light natural blemishes"
-            advice = "Ready to eat now or within two to three days. Check smell and firmness before cutting."
-
-        spoken_text = (
-            f"Detected {best_fruit} showing {surface_desc}. {advice}"
-        )
-
-        return {
-            "fruit_name": best_fruit,
-            "surface_description": surface_desc,
-            "urgency": urgency,
-            "spoken_text": spoken_text,
-        }
+        """Backward-compatible entry point for the previous FreshPick code."""
+        return self.analyze_views([bgr_crop])

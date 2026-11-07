@@ -1,6 +1,10 @@
-opencv-python>=4.8.0
-mediapipe>=0.10.9
-pyttsx3>=2.90
-numpy>=1.24.0
-Pillow>=10.0.0
-google-genai>=0.3.0
+# Python 3.11 recommended. A webcam and working system TTS voice are required.
+mediapipe>=0.10.20,<0.11
+opencv-python>=4.8,<5
+numpy>=1.26,<3
+Pillow>=10,<13
+pyttsx3>=2.90,<3
+python-dotenv>=1.0,<2
+pydantic>=2.6,<3
+google-genai>=1.0,<2
+# Optional local model: install transformers, torch, accelerate & einops separately.

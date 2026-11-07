@@ -1,146 +1,198 @@
-import os
-import sys
-import threading
-import cv2
+"""FreshPick multiview, voice-first fruit scanning prototype.
 
-# Ensure local sibling modules resolve regardless of working directory
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+Commands: pinch or SPACE = guided scan; open palm or R = priority summary;
+thumbs-up or H = safety reminder; M = mute; X = cancel waiting speech;
+U = undo last; Q = quit. No visual UI action is essential to the core scan.
+"""
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import queue
+import threading
+import time
+
+import cv2
+from dotenv import load_dotenv
 
 from audio_engine import AudioEngine
 from gesture_controller import GestureController
 from hud import HUD
 from pantry_memory import PantryMemory
 from vision_analyzer import VisionAnalyzer
+from workflow import Phase, ScanSession
+
+ROOT = Path(__file__).resolve().parent
+SAFETY_NOTE = (
+    "The camera sees only the outside. It cannot establish food safety. "
+    "Check for unusual softness, odor, or visible mold and discard suspicious fruit."
+)
+
+
+def crop_around_fruit(frame, bbox):
+    h, w = frame.shape[:2]
+    if bbox:
+        x1, y1, x2, y2 = bbox
+    else:
+        # Central ROI fallback is for one fruit held in front of the lens.
+        x1, y1, x2, y2 = int(w * .16), int(h * .13), int(w * .84), int(h * .90)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return frame[y1:y2, x1:x2].copy()
 
 
 def main():
-    audio = AudioEngine(rate=175)
-    gesture_ctrl = GestureController()
-    vision = VisionAnalyzer()
-    pantry = PantryMemory()
-    hud = HUD()
+    parser = argparse.ArgumentParser(description="FreshPick voice-first guided fruit scanner")
+    parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--backend", choices=("gemini", "moondream", "opencv"), default="gemini")
+    parser.add_argument("--tts-volume", type=float, default=0.65)
+    args = parser.parse_args()
+    load_dotenv(ROOT / ".env", override=False)
 
-    cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 540)
-
-    if not cap.isOpened():
-        print("Error: Could not access webcam.")
-        audio.speak("Camera could not be opened. Please check your webcam connection.")
-        return
-
-    state = {
-        "caption": "Hold a fruit in front of the camera and pinch thumb + index finger to scan.",
-        "busy": False,
-    }
-
-    audio.speak(
-        "FreshPick ready. Hold a fruit near the center and pinch to hear its visual description and freshness priority."
-    )
-
-    def run_single_scan(crop_img):
-        state["busy"] = True
-        state["caption"] = "Scanning fruit surface and translating image to speech..."
-        try:
-            result = vision.analyze_single_fruit(crop_img)
-            pantry.add_item(result)
-            state["caption"] = result["spoken_text"]
-            audio.speak(result["spoken_text"], interrupt=True)
-        finally:
-            state["busy"] = False
-
-    def run_dual_comparison(left_crop, right_crop):
-        state["busy"] = True
-        state["caption"] = "Comparing fruits in your left and right hands..."
-        try:
-            comparison_speech = vision.compare_two_fruits(left_crop, right_crop)
-            state["caption"] = comparison_speech
-            audio.speak(comparison_speech, interrupt=True)
-        finally:
-            state["busy"] = False
+    audio = AudioEngine(rate=190, volume=args.tts_volume)
+    vision = VisionAnalyzer(backend=args.backend)
+    pantry = PantryMemory(path=str(ROOT / "pantry_session.json"))
+    gestures = None
+    camera = None
+    session = ScanSession()
+    results = queue.SimpleQueue()
+    last_readout = "FreshPick ready."
+    caption = "Pinch or press SPACE to scan. Open palm or R for priority list."
 
     try:
+        gestures = GestureController()
+        camera = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW) if __import__("sys").platform == "win32" else cv2.VideoCapture(args.camera)
+        camera.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
+        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 540)
+        if not camera.isOpened():
+            raise RuntimeError("No working camera found. Try --camera 1 or check permissions.")
+        print("Controls: SPACE=scan, R=recap, H=safety, M=mute, X=drop queued speech, U=undo, Q=quit")
+        audio.speak("FreshPick ready. Pinch to start a fruit scan. Open your palm to hear the use-first list.")
+
+        def launch_inference(frames):
+            def runner():
+                try:
+                    output = vision.analyze_views(frames)
+                except Exception as exc:
+                    from decision_engine import unknown_result
+                    print("Unexpected inference error:", exc)
+                    output = unknown_result("The vision system encountered an error.")
+                results.put(output)
+            threading.Thread(target=runner, daemon=True).start()
+
         while True:
-            ret, frame = cap.read()
-            if not ret:
+            ok, frame = camera.read()
+            if not ok:
+                print("Camera frame unavailable; exiting.")
                 break
-
-            # Mirror view for intuitive hand interaction
             frame = cv2.flip(frame, 1)
-
-            (
-                annotated_frame,
-                gesture_event,
-                gesture_progress,
-                hand_data,
-                centering_hint,
-            ) = gesture_ctrl.process_frame(frame)
-
-            # Give gentle audio centering hints if hand is near edge of camera
-            if centering_hint and not state["busy"]:
-                audio.speak_centering_hint(centering_hint)
-
-            # Handle Gesture Events
-            if gesture_event and not state["busy"]:
-                audio.play_scan_trigger_tone()
-
-                if gesture_event == "PINCH_SCAN" and hand_data:
-                    # If 2 hands are visible (1 holding fruit, 1 pinching), scan the non-pinching hand crop or largest crop
-                    target_crop = max(
-                        hand_data,
-                        key=lambda h: (h["bbox"][2] - h["bbox"][0]) * (h["bbox"][3] - h["bbox"][1]),
-                    )["crop"]
-                    threading.Thread(
-                        target=run_single_scan, args=(target_crop,), daemon=True
-                    ).start()
-
-                elif gesture_event == "DUAL_COMPARE" and len(hand_data) >= 2:
-                    # Sort hands left-to-right on screen
-                    sorted_hands = sorted(hand_data, key=lambda h: h["center"][0])
-                    left_crop = sorted_hands[0]["crop"]
-                    right_crop = sorted_hands[1]["crop"]
-                    threading.Thread(
-                        target=run_dual_comparison,
-                        args=(left_crop, right_crop),
-                        daemon=True,
-                    ).start()
-
-                elif gesture_event == "PALM_RECAP":
-                    recap_text = pantry.get_spoken_recap()
-                    state["caption"] = recap_text
-                    audio.speak(recap_text, interrupt=True)
-
-                elif gesture_event == "THUMB_SAFETY":
-                    safety_note = (
-                        "Safety reminder: Cameras only see outer peel color and spots. "
-                        "Always press gently for soft spots and smell near the stem to check for internal spoilage."
-                    )
-                    state["caption"] = safety_note
-                    audio.speak(safety_note, interrupt=True)
-
-            # Render accessibility HUD
-            display_frame = hud.render(
-                frame=annotated_frame,
-                hand_data=hand_data,
-                gesture_progress=gesture_progress,
-                last_caption=state["caption"],
-                pantry_items=pantry.get_sorted_items(),
-            )
-
-            cv2.imshow("FreshPick - Beyond Gesture (SHN #01)", display_frame)
-
+            now = time.monotonic()
+            # No gesture triggers during active capture, but hand geometry continues.
+            hand = gestures.process_frame(frame, allow_gestures=session.phase == Phase.IDLE)
+            command = hand.event
             key = cv2.waitKey(1) & 0xFF
-            if key == ord("q") or key == 27:
+            if key in (ord("q"), 27):
                 break
+            if key == ord(" "):
+                command = "PINCH_SCAN"
             elif key == ord("r"):
-                # Keyboard shortcut backup for demoing Pantry Recap
-                recap_text = pantry.get_spoken_recap()
-                state["caption"] = recap_text
-                audio.speak(recap_text, interrupt=True)
+                command = "PALM_RECAP"
+            elif key == ord("h"):
+                command = "THUMB_SAFETY"
+            elif key == ord("m"):
+                was_muted = audio.toggle_mute()
+                caption = "Audio muted" if was_muted else "Audio unmuted"
+                if not was_muted:
+                    audio.speak("Sound on.")
+            elif key == ord("x"):
+                audio.stop_pending()
+                audio.stop_current()
+                caption = "Speech stopped."
+            elif key == ord("u") and session.phase == Phase.IDLE:
+                caption = "Last entry removed" if pantry.remove_last() else "Nothing to undo"
+                audio.speak(caption, interrupt=True)
 
+            if command == "PINCH_SCAN" and session.begin(now):
+                gestures.reset_rotation_reference()
+                audio.play_scan_trigger_tone()
+                caption = "Hold one fruit steady. Starting guided scan."
+                audio.speak("Hold the fruit in the middle.", interrupt=True)
+            elif command == "PALM_RECAP" and session.phase == Phase.IDLE:
+                last_readout = pantry.get_spoken_recap(max_items=3)
+                caption = last_readout
+                audio.speak(last_readout, interrupt=True)
+            elif command == "THUMB_SAFETY" and session.phase == Phase.IDLE:
+                caption = SAFETY_NOTE
+                audio.speak(SAFETY_NOTE, interrupt=True)
+
+            # Always capture raw, unannotated frames so HUD graphics do not confuse the VLM.
+            if session.phase in (Phase.ALIGN, Phase.ROTATE):
+                slot = session.due_capture_slot(now)
+                if slot is not None:
+                    crop = crop_around_fruit(frame, hand.bbox)
+                    if crop is not None:
+                        session.frames.append(crop)
+                        audio.play_beep(880 + slot * 140, 70)
+                if session.elapsed(now) >= 2.0 and not session.turn_announced:
+                    session.turn_announced = True
+                    caption = "Slowly rotate the fruit to show a different side."
+                    audio.speak("Turn fruit slowly.")
+                if (hand.estimated_hand_turn_degrees is not None
+                        and hand.estimated_hand_turn_degrees > 65
+                        and not session.last_rotation_tone):
+                    session.last_rotation_tone = True
+                    audio.play_beep(1250, 110)  # Only a *hand orientation* hint.
+
+                previous = session.phase
+                session.advance(now)
+                if previous != Phase.ANALYZING and session.phase == Phase.ANALYZING:
+                    caption = "Checking visible fruit features."
+                    audio.speak("Checking the fruit.")
+                    launch_inference(session.frames.copy())
+
+            elif session.phase == Phase.ANALYZING:
+                if now - session.last_tick_at >= 1.5 and not audio.is_speaking:
+                    session.last_tick_at = now
+                    audio.play_beep(540, 35)
+                try:
+                    result = results.get_nowait()
+                except queue.Empty:
+                    result = None
+                if result is not None:
+                    saved = pantry.add_item(result)
+                    last_readout = result["spoken_text"]
+                    if saved:
+                        last_readout += " Added to your use-first list."
+                    caption = last_readout
+                    audio.speak(last_readout, interrupt=True)
+                    session.readout(now)
+            elif session.phase == Phase.READOUT:
+                session.advance(now)
+                if session.phase == Phase.IDLE:
+                    caption = "Ready for another fruit. Pinch or press SPACE."
+            elif session.phase == Phase.IDLE and hand.hint:
+                # Do not spam if user isn't preparing to scan; only guide when hand is visible.
+                if hand.hand_visible:
+                    audio.speak_centering_hint(hand.hint)
+
+            img = HUD.render(frame, session.phase.value, caption, pantry.get_sorted_items(),
+                             bbox=hand.bbox, progress=hand.progress,
+                             elapsed=session.elapsed(now),
+                             turn_degrees=(round(hand.estimated_hand_turn_degrees)
+                                           if hand.estimated_hand_turn_degrees is not None else None),
+                             muted=audio.muted)
+            # Visualize MediaPipe joints on the preview, NOT on frames sent to Gemini.
+            img = gestures.draw_landmarks(img)
+            cv2.imshow("FreshPick | Audio-first prototype", img)
+
+    except (KeyboardInterrupt, Exception) as exc:
+        print("FreshPick stopped:", repr(exc))
+        raise
     finally:
-        cap.release()
-        gesture_ctrl.close()
+        if camera is not None:
+            camera.release()
+        if gestures is not None:
+            gestures.close()
         audio.shutdown()
         cv2.destroyAllWindows()
 

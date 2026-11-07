@@ -1,272 +1,234 @@
+"""MediaPipe Hand Landmarker LIVE_STREAM gesture remote and hand-based framing.
+
+Palm-normal changes are approximate orientation hints, NOT proof of 180/360
+fruit coverage. The first few webcam frames may have no callback result yet.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
 import math
-import os
+from pathlib import Path
+import threading
 import time
 import urllib.request
+
 import cv2
 import mediapipe as mp
+import numpy as np
 
-# Official MediaPipe HandLandmarker model URL (auto-downloaded once if using Tasks API)
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
-MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
+MODEL_PATH = Path(__file__).resolve().parent / "assets" / "hand_landmarker.task"
+LEGACY_PATH = Path(__file__).resolve().parent / "hand_landmarker.task"
 
-HAND_CONNECTIONS = [
-    (0, 1), (1, 2), (2, 3), (3, 4),
-    (0, 5), (5, 6), (6, 7), (7, 8),
-    (5, 9), (9, 10), (10, 11), (11, 12),
-    (9, 13), (13, 14), (14, 15), (15, 16),
-    (13, 17), (0, 17), (17, 18), (18, 19), (19, 20),
-]
+
+@dataclass
+class GestureObservation:
+    event: str | None = None
+    progress: float = 0.0
+    bbox: tuple[int, int, int, int] | None = None
+    hint: str | None = None
+    hand_visible: bool = False
+    estimated_hand_turn_degrees: float | None = None
+
+
+def _distance(a, b) -> float:
+    return math.hypot(a.x - b.x, a.y - b.y)
+
+
+def _angle_between(a: np.ndarray, b: np.ndarray) -> float:
+    cos_value = float(np.clip(np.dot(a, b), -1.0, 1.0))
+    return math.degrees(math.acos(cos_value))
 
 
 class GestureController:
     def __init__(self):
-        self.use_tasks_api = not hasattr(mp, "solutions")
+        from mediapipe.tasks import python as mp_python
+        from mediapipe.tasks.python import vision as mp_vision
 
-        if not self.use_tasks_api:
-            # Legacy MediaPipe (<= 0.10.21)
-            self.mp_hands = mp.solutions.hands
-            self.hands = self.mp_hands.Hands(
-                static_image_mode=False,
-                max_num_hands=2,
-                min_detection_confidence=0.7,
-                min_tracking_confidence=0.7,
-            )
+        model_path = MODEL_PATH if MODEL_PATH.exists() or not LEGACY_PATH.exists() else LEGACY_PATH
+        if not model_path.exists():
+            model_path.parent.mkdir(exist_ok=True, parents=True)
+            print("Downloading the official hand_landmarker.task once...")
+            try:
+                urllib.request.urlretrieve(MODEL_URL, str(model_path))
+            except Exception as exc:
+                raise RuntimeError("Download the MediaPipe hand_landmarker.task into assets/ manually. " + str(exc)) from exc
+        self._lock = threading.Lock()
+        self._latest = None
+        self._latest_time = 0.0
+        self._frame_clock = 0
+        self._candidate = None
+        self._candidate_since = 0.0
+        self._armed = True
+        self._last_emit = 0.0
+        self._initial_normal = None
+        self._fruit_hand_label = None
+        options = mp_vision.HandLandmarkerOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
+            running_mode=mp_vision.RunningMode.LIVE_STREAM,
+            num_hands=2,
+            min_hand_detection_confidence=0.6,
+            min_hand_presence_confidence=0.55,
+            min_tracking_confidence=0.55,
+            result_callback=self._on_result,
+        )
+        self.landmarker = mp_vision.HandLandmarker.create_from_options(options)
+
+    def _on_result(self, result, output_image, timestamp_ms: int) -> None:
+        with self._lock:
+            self._latest = result
+            self._latest_time = time.monotonic()
+
+    def reset_rotation_reference(self) -> None:
+        self._initial_normal = None
+
+    def _palm_normal(self, xyz) -> np.ndarray | None:
+        if not xyz:
+            return None
+        wrist = np.array([xyz[0].x, xyz[0].y, xyz[0].z])
+        v1 = np.array([xyz[5].x, xyz[5].y, xyz[5].z]) - wrist
+        v2 = np.array([xyz[17].x, xyz[17].y, xyz[17].z]) - wrist
+        normal = np.cross(v1, v2)
+        size = float(np.linalg.norm(normal))
+        return normal / size if size > 1e-6 else None
+
+    def _gesture_kind(self, lms) -> str | None:
+        palm_width = max(0.01, _distance(lms[5], lms[17]))
+        pinch = _distance(lms[4], lms[8]) / palm_width
+        fingers_extended = [
+            _distance(lms[tip], lms[0]) > _distance(lms[pip], lms[0]) * 1.14
+            for tip, pip in ((8, 6), (12, 10), (16, 14), (20, 18))
+        ]
+        if pinch < 0.38:
+            return "PINCH_SCAN"
+        if all(fingers_extended) and pinch > 0.8:
+            return "PALM_RECAP"
+        if not any(fingers_extended) and _distance(lms[4], lms[0]) > _distance(lms[3], lms[0]) * 1.25:
+            return "THUMB_SAFETY"
+        return None
+
+    def process_frame(self, frame: np.ndarray, allow_gestures: bool = True) -> GestureObservation:
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb = np.ascontiguousarray(rgb)
+        now = time.monotonic()
+        timestamp = int(now * 1000)
+        timestamp = max(timestamp, self._frame_clock + 1)
+        self._frame_clock = timestamp
+        image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        self.landmarker.detect_async(image, timestamp)
+
+        with self._lock:
+            result = self._latest if now - self._latest_time < 0.6 else None
+        if not result or not result.hand_landmarks:
+            self._candidate, self._armed = None, True
+            return GestureObservation(hint="Place a hand holding one fruit near the middle of the camera.")
+
+        hands = result.hand_landmarks[:2]
+        labels = [
+            (result.handedness[i][0].category_name if i < len(result.handedness)
+             and result.handedness[i] else f"Hand {i}")
+            for i in range(len(hands))
+        ]
+        kinds = [self._gesture_kind(candidate) for candidate in hands]
+        controller_index = next((i for i, gesture in enumerate(kinds) if gesture == "PINCH_SCAN"), None)
+        if controller_index is None:
+            controller_index = next((i for i, gesture in enumerate(kinds) if gesture is not None), 0)
+        # With two hands, one may hold the fruit while the other pinches to scan.
+        if not allow_gestures and self._fruit_hand_label in labels:
+            fruit_index = labels.index(self._fruit_hand_label)
+        elif len(hands) == 2 and kinds[controller_index] == "PINCH_SCAN":
+            fruit_index = 1 - controller_index
         else:
-            # Modern MediaPipe Tasks API (0.10.31+)
-            from mediapipe.tasks import python as mp_python
-            from mediapipe.tasks.python import vision as mp_vision
+            fruit_index = 0
+        lms = hands[fruit_index]
+        h, w = frame.shape[:2]
+        # Expand well beyond hand bounds because fruit is usually bigger than hand.
+        xs, ys = [p.x for p in lms], [p.y for p in lms]
+        cx = (min(xs) + max(xs)) * 0.5
+        cy = (min(ys) + max(ys)) * 0.5
+        box_w = max(0.66, (max(xs) - min(xs)) + 0.32)
+        box_h = max(0.70, (max(ys) - min(ys)) + 0.34)
+        x1, x2 = max(0, int((cx - box_w / 2) * w)), min(w, int((cx + box_w / 2) * w))
+        y1, y2 = max(0, int((cy - box_h / 2) * h)), min(h, int((cy + box_h / 2) * h))
+        box = (x1, y1, x2, y2)
+        hint = None
+        if cx < 0.29:
+            hint = "Move your hand right."
+        elif cx > 0.71:
+            hint = "Move your hand left."
+        elif cy < 0.25:
+            hint = "Move your hand down."
+        elif cy > 0.75:
+            hint = "Move your hand up."
+        elif (max(xs) - min(xs)) < 0.11:
+            hint = "Move your fruit a little closer."
 
-            if not os.path.exists(MODEL_PATH):
-                print("[GestureController] Downloading hand_landmarker.task model (~7.5 MB)...")
-                urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
-                print("[GestureController] Model downloaded successfully.")
+        normal = self._palm_normal(result.hand_world_landmarks[fruit_index]
+                                   if result.hand_world_landmarks
+                                   and fruit_index < len(result.hand_world_landmarks) else None)
+        degrees = None
+        if normal is not None:
+            if self._initial_normal is None:
+                self._initial_normal = normal
+            degrees = _angle_between(self._initial_normal, normal)
 
-            base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
-            options = mp_vision.HandLandmarkerOptions(
-                base_options=base_options,
-                num_hands=2,
-                min_hand_detection_confidence=0.65,
-                min_hand_presence_confidence=0.65,
-                min_tracking_confidence=0.65,
-            )
-            self.landmarker = mp_vision.HandLandmarker.create_from_options(options)
+        if not allow_gestures:
+            self._candidate, self._armed = None, True
+            return GestureObservation(bbox=box, hint=hint, hand_visible=True, estimated_hand_turn_degrees=degrees)
 
-        # Hold counters to avoid accidental triggers
-        self.pinch_frames = 0
-        self.PINCH_REQUIRED = 12       # ~0.4s hold
+        raw = kinds[controller_index]
+        if raw != self._candidate:
+            self._candidate = raw
+            self._candidate_since = now
+            if raw is None:
+                self._armed = True
+        durations = {"PINCH_SCAN": 0.55, "PALM_RECAP": 0.75, "THUMB_SAFETY": 0.75}
+        target = durations.get(raw, 0)
+        progress = min(1.0, (now - self._candidate_since) / target) if target else 0.0
+        event = None
+        if raw and self._armed and now - self._candidate_since >= target and now - self._last_emit >= 1.5:
+            event = raw
+            self._last_emit = now
+            self._armed = False
+            if event == "PINCH_SCAN":
+                self._fruit_hand_label = labels[fruit_index]
+        return GestureObservation(event=event, progress=progress, bbox=box, hint=hint,
+                                  hand_visible=True, estimated_hand_turn_degrees=degrees)
 
-        self.palm_frames = 0
-        self.PALM_REQUIRED = 18        # ~0.6s hold
+    def draw_landmarks(self, frame: np.ndarray) -> np.ndarray:
+        """Draw visible hand joints and skeleton on a DISPLAY image only.
 
-        self.dual_frames = 0
-        self.DUAL_REQUIRED = 25        # ~0.85s hold with 2 hands
+        Never pass this annotated image into the vision model.
+        """
+        with self._lock:
+            result = self._latest if time.monotonic() - self._latest_time < 0.6 else None
+        if result is None or not result.hand_landmarks:
+            return frame
 
-        self.thumb_frames = 0
-        self.THUMB_REQUIRED = 16
+        h, w = frame.shape[:2]
+        connections = (
+            (0, 1), (1, 2), (2, 3), (3, 4),
+            (0, 5), (5, 6), (6, 7), (7, 8),
+            (5, 9), (9, 10), (10, 11), (11, 12),
+            (9, 13), (13, 14), (14, 15), (15, 16),
+            (13, 17), (17, 18), (18, 19), (19, 20),
+            (0, 17),
+        )
+        for hand in result.hand_landmarks:
+            coords = [
+                (max(0, min(w - 1, int(pt.x * w))),
+                 max(0, min(h - 1, int(pt.y * h))))
+                for pt in hand
+            ]
+            for a, b in connections:
+                cv2.line(frame, coords[a], coords[b], (0, 240, 180), 2,
+                         cv2.LINE_AA)
+            for x, y in coords:
+                cv2.circle(frame, (x, y), 4, (255, 255, 255), -1,
+                           cv2.LINE_AA)
+                cv2.circle(frame, (x, y), 5, (0, 200, 100), 1,
+                           cv2.LINE_AA)
+        return frame
 
-        self.last_trigger_time = 0.0
-        self.cooldown_sec = 3.5        # Cooldown between scans
-
-    def _draw_hand_skeleton(self, frame, lms):
-        """Draw 21 hand landmarks and connections using pure OpenCV."""
-        h, w, _ = frame.shape
-        pts = [(int(lm.x * w), int(lm.y * h)) for lm in lms]
-        for p1, p2 in HAND_CONNECTIONS:
-            cv2.line(frame, pts[p1], pts[p2], (0, 220, 150), 2)
-        for x, y in pts:
-            cv2.circle(frame, (x, y), 4, (255, 255, 255), -1)
-
-    def _count_extended_fingers(self, lms) -> int:
-        tips = [8, 12, 16, 20]
-        pips = [6, 10, 14, 18]
-        extended = 0
-        for tip, pip in zip(tips, pips):
-            if lms[tip].y < lms[pip].y:
-                extended += 1
-        return extended
-
-    def _is_thumbs_up(self, lms) -> bool:
-        thumb_tip = lms[4]
-        thumb_ip = lms[3]
-        index_mcp = lms[5]
-        other_fingers = self._count_extended_fingers(lms)
-        return (thumb_tip.y < thumb_ip.y < index_mcp.y) and (other_fingers == 0)
-
-    def _extract_hand_crop(self, raw_frame, lms, pad: float = 0.14):
-        h, w, _ = raw_frame.shape
-        xs = [lm.x for lm in lms]
-        ys = [lm.y for lm in lms]
-
-        x1 = max(0, int((min(xs) - pad) * w))
-        y1 = max(0, int((min(ys) - pad) * h))
-        x2 = min(w, int((max(xs) + pad) * w))
-        y2 = min(h, int((max(ys) + pad) * h))
-
-        crop = raw_frame[y1:y2, x1:x2].copy()
-        return crop, (x1, y1, x2, y2)
-
-    def _detect_hands(self, rgb_frame):
-        """Unified detector returning (list_of_21_landmarks, list_of_hand_labels)."""
-        if not self.use_tasks_api:
-            results = self.hands.process(rgb_frame)
-            if not results.multi_hand_landmarks:
-                return [], []
-            landmarks_list = [hl.landmark for hl in results.multi_hand_landmarks]
-            labels = []
-            for idx in range(len(landmarks_list)):
-                if results.multi_handedness and idx < len(results.multi_handedness):
-                    labels.append(results.multi_handedness[idx].classification[0].label)
-                else:
-                    labels.append("Hand")
-            return landmarks_list, labels
-        else:
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-            result = self.landmarker.detect(mp_image)
-            if not result.hand_landmarks:
-                return [], []
-            landmarks_list = result.hand_landmarks
-            labels = []
-            for idx in range(len(landmarks_list)):
-                if result.handedness and idx < len(result.handedness):
-                    labels.append(result.handedness[idx][0].category_name or "Hand")
-                else:
-                    labels.append("Hand")
-            return landmarks_list, labels
-
-    def process_frame(self, frame):
-        raw_frame = frame.copy()
-        annotated = frame.copy()
-        h, w, _ = annotated.shape
-
-        rgb = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2RGB)
-        landmarks_list, labels = self._detect_hands(rgb)
-
-        gesture_event = None
-        gesture_progress = 0.0
-        hand_data = []
-        centering_hint = None
-
-        now = time.time()
-        in_cooldown = (now - self.last_trigger_time) < self.cooldown_sec
-
-        if landmarks_list:
-            num_hands = len(landmarks_list)
-
-            for idx, lms in enumerate(landmarks_list):
-                label = labels[idx]
-                self._draw_hand_skeleton(annotated, lms)
-
-                crop, bbox = self._extract_hand_crop(raw_frame, lms)
-                middle_mcp = lms[9]
-                wrist = lms[0]
-
-                hand_data.append({
-                    "label": label,
-                    "crop": crop,
-                    "bbox": bbox,
-                    "center": (middle_mcp.x, middle_mcp.y),
-                })
-
-                # Spatial audio guidance for visually impaired framing (primary hand)
-                if idx == 0:
-                    hand_size = math.hypot(middle_mcp.x - wrist.x, middle_mcp.y - wrist.y)
-                    if hand_size < 0.09:
-                        centering_hint = "Bring the fruit slightly closer to the camera."
-                    elif middle_mcp.x < 0.22 or middle_mcp.x > 0.78:
-                        centering_hint = "Move your hand slightly toward the center."
-                    elif middle_mcp.y < 0.20:
-                        centering_hint = "Lower your hand slightly."
-                    elif middle_mcp.y > 0.82:
-                        centering_hint = "Raise your hand slightly."
-
-                # 1. Measure Pinch (Thumb tip #4 to Index tip #8)
-                thumb = lms[4]
-                index = lms[8]
-                pinch_dist = math.hypot(thumb.x - index.x, thumb.y - index.y)
-
-                tx, ty = int(thumb.x * w), int(thumb.y * h)
-                ix, iy = int(index.x * w), int(index.y * h)
-                is_pinching = pinch_dist < 0.048
-                cv2.line(
-                    annotated,
-                    (tx, ty),
-                    (ix, iy),
-                    (0, 255, 120) if is_pinching else (0, 200, 255),
-                    3,
-                )
-
-                if not in_cooldown:
-                    if is_pinching:
-                        self.pinch_frames += 1
-                        gesture_progress = max(
-                            gesture_progress,
-                            min(1.0, self.pinch_frames / self.PINCH_REQUIRED),
-                        )
-                        if self.pinch_frames >= self.PINCH_REQUIRED:
-                            gesture_event = "PINCH_SCAN"
-                            self._reset_counters()
-                            self.last_trigger_time = now
-                            break
-                    elif idx == 0:
-                        self.pinch_frames = max(0, self.pinch_frames - 1)
-
-                    # 2. Check Open Palm (4 fingers extended & not pinching)
-                    extended_count = self._count_extended_fingers(lms)
-                    if extended_count == 4 and pinch_dist > 0.11 and num_hands == 1:
-                        self.palm_frames += 1
-                        gesture_progress = max(
-                            gesture_progress,
-                            min(1.0, self.palm_frames / self.PALM_REQUIRED),
-                        )
-                        if self.palm_frames >= self.PALM_REQUIRED:
-                            gesture_event = "PALM_RECAP"
-                            self._reset_counters()
-                            self.last_trigger_time = now
-                            break
-                    elif idx == 0:
-                        self.palm_frames = max(0, self.palm_frames - 1)
-
-                    # 3. Check Thumbs Up (Tactile & Olfactory safety tip)
-                    if self._is_thumbs_up(lms) and num_hands == 1:
-                        self.thumb_frames += 1
-                        gesture_progress = max(
-                            gesture_progress,
-                            min(1.0, self.thumb_frames / self.THUMB_REQUIRED),
-                        )
-                        if self.thumb_frames >= self.THUMB_REQUIRED:
-                            gesture_event = "THUMB_SAFETY"
-                            self._reset_counters()
-                            self.last_trigger_time = now
-                            break
-                    elif idx == 0:
-                        self.thumb_frames = max(0, self.thumb_frames - 1)
-
-            # 4. Two-Hand Comparison Mode
-            if not in_cooldown and gesture_event is None and num_hands == 2:
-                self.dual_frames += 1
-                gesture_progress = max(
-                    gesture_progress,
-                    min(1.0, self.dual_frames / self.DUAL_REQUIRED),
-                )
-                if self.dual_frames >= self.DUAL_REQUIRED:
-                    gesture_event = "DUAL_COMPARE"
-                    self._reset_counters()
-                    self.last_trigger_time = now
-            else:
-                self.dual_frames = max(0, self.dual_frames - 1)
-        else:
-            self._reset_counters()
-
-        return annotated, gesture_event, gesture_progress, hand_data, centering_hint
-
-    def _reset_counters(self):
-        self.pinch_frames = 0
-        self.palm_frames = 0
-        self.dual_frames = 0
-        self.thumb_frames = 0
-
-    def close(self):
-        if not self.use_tasks_api:
-            self.hands.close()
-        else:
-            self.landmarker.close()
+    def close(self) -> None:
+        self.landmarker.close()

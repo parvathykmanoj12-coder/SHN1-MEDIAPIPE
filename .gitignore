@@ -1,6 +1,11 @@
 ﻿.venv/
+venv/
 .env
-__pycache__/
 *.task
 *.pyc
+__pycache__/
+.pytest_cache/
+.pyright/
 pantry_session.json
+pantry_session.json.tmp
+.DS_Store

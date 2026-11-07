@@ -1,66 +1,76 @@
+"""Persistent pantry inventory. No photos are stored; uncertain scans are excluded."""
+from __future__ import annotations
+
 from datetime import datetime
+import json
+import os
+from pathlib import Path
+from threading import RLock
+
+from decision_engine import URGENCY_WEIGHT
 
 
 class PantryMemory:
-    URGENCY_ORDER = {
-        "EAT_TODAY": 1,
-        "USE_SOON": 2,
-        "STORE_LONGER": 3,
-    }
+    def __init__(self, path: str = "pantry_session.json"):
+        self.path = Path(path)
+        self._lock = RLock()
+        self.items: list[dict] = []
+        self._load()
 
-    URGENCY_LABELS = {
-        "EAT_TODAY": "Eat Today",
-        "USE_SOON": "Use in 2 to 3 Days",
-        "STORE_LONGER": "Can Stay Longer",
-    }
+    def _load(self) -> None:
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                self.items = [row for row in data if isinstance(row, dict) and row.get("urgency") in URGENCY_WEIGHT]
+        except (FileNotFoundError, ValueError, OSError):
+            self.items = []
 
-    def __init__(self):
-        self.items = []
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temp = self.path.with_name(self.path.name + ".tmp")
+        temp.write_text(json.dumps(self.items, indent=2), encoding="utf-8")
+        os.replace(temp, self.path)
 
-    def add_item(self, scan_result: dict):
-        entry = {
-            "id": len(self.items) + 1,
-            "fruit_name": scan_result.get("fruit_name", "Fruit"),
-            "surface_description": scan_result.get("surface_description", ""),
-            "urgency": scan_result.get("urgency", "USE_SOON"),
-            "timestamp": datetime.now().strftime("%H:%M:%S"),
-        }
-        self.items.append(entry)
-        return entry
+    def add_item(self, scan_result: dict) -> dict | None:
+        if scan_result.get("urgency") not in URGENCY_WEIGHT or scan_result.get("review_required"):
+            return None
+        with self._lock:
+            item = {
+                "id": max((int(x.get("id", 0)) for x in self.items), default=0) + 1,
+                "fruit_name": str(scan_result.get("fruit_name") or "Fruit")[:60],
+                "surface_description": str(scan_result.get("surface_description") or "")[:160],
+                "urgency": scan_result["urgency"],
+                "weight": URGENCY_WEIGHT[scan_result["urgency"]],
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            }
+            self.items.append(item)
+            self._save()
+            return item
 
-    def get_sorted_items(self):
-        return sorted(
-            self.items,
-            key=lambda x: self.URGENCY_ORDER.get(x.get("urgency", "USE_SOON"), 2),
-        )
+    def get_sorted_items(self) -> list[dict]:
+        with self._lock:
+            return sorted((x.copy() for x in self.items), key=lambda x: (URGENCY_WEIGHT[x["urgency"]], x["id"]))
 
-    def get_spoken_recap(self) -> str:
-        if not self.items:
-            return "Your pantry scan list is currently empty. Hold a fruit and pinch your thumb and index finger to scan."
+    def get_spoken_recap(self, max_items: int = 5) -> str:
+        ordered = self.get_sorted_items()
+        if not ordered:
+            return "Your fruit list is empty. Hold a fruit and pinch to scan."
+        labels = {"EAT_TODAY": "use first", "USE_SOON": "use soon", "STORE_LONGER": "keep longer"}
+        # Short enough for a spoken summary; repeated names carry IDs.
+        shown = ordered[:max_items]
+        chunks = [f"{x['fruit_name']}, item {x['id']}, {labels[x['urgency']]}" for x in shown]
+        more = f" {len(ordered) - len(shown)} more items not read." if len(ordered) > len(shown) else ""
+        return "Consumption order: " + "; ".join(chunks) + "." + more
 
-        sorted_items = self.get_sorted_items()
-        eat_first = [
-            item["fruit_name"]
-            for item in sorted_items
-            if item["urgency"] == "EAT_TODAY"
-        ]
-        use_soon = [
-            item["fruit_name"]
-            for item in sorted_items
-            if item["urgency"] == "USE_SOON"
-        ]
-        keep_longer = [
-            item["fruit_name"]
-            for item in sorted_items
-            if item["urgency"] == "STORE_LONGER"
-        ]
+    def remove_last(self) -> bool:
+        with self._lock:
+            if not self.items:
+                return False
+            self.items.pop()
+            self._save()
+            return True
 
-        parts = [f"You have scanned {len(self.items)} items so far."]
-        if eat_first:
-            parts.append(f"Use first today: {', '.join(eat_first)}.")
-        if use_soon:
-            parts.append(f"Use within two to three days: {', '.join(use_soon)}.")
-        if keep_longer:
-            parts.append(f"Can stay longer: {', '.join(keep_longer)}.")
-
-        return " ".join(parts)
+    def clear(self) -> None:
+        with self._lock:
+            self.items.clear()
+            self._save()
